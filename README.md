@@ -1,3 +1,45 @@
-# [AAAI 2026] DSFedMed: Dual-Scale Federated Medical Image Segmentation via Mutual Distillation between Foundation and Lightweight Models
+# 📌 [AAAI 2026] DSFedMed: Federated Medical Image Segmentation between Foundation and Lightweight Models
 
-Foundation Models (FMs) have demonstrated strong generalization across diverse vision tasks. However, their deployment in federated settings is hindered by high computational demands, substantial communication overhead, and significant inference costs. We propose DSFedMed, a dual-scale federated framework that enables mutual knowledge distillation between a centralized foundation model and lightweight client models for medical image segmentation. To support knowledge distillation, a set of high-quality medical images is generated to replace real public datasets, and a learnability-guided sample selection strategy is proposed to enhance efficiency and effectiveness in dual-scale distillation. This mutual distillation enables the foundation model to transfer general knowledge to lightweight clients, while also incorporating client-specific insights to refine the foundation model. Evaluations on five medical imaging segmentation datasets show that DSFedMed achieves an average 2 percent improvement in Dice score while reducing communication costs and inference time by nearly 90 percent compared to existing federated foundation model baselines. These results demonstrate significant efficiency gains and scalability for resource-limited federated deployments.
+## 🧠 Overview
+This repository implements **DSFedMed**, a synthetic data-driven federated learning framework for medical image segmentation.  
+The core idea is to leverage **synthetic data and bidirectional knowledge distillation** to improve global model performance under **data heterogeneity (Non-IID)** and **privacy constraints**.
+
+---
+
+## 🚀 Key Features
+
+- 🔒 Privacy-preserving federated learning (no raw data sharing)
+- 🧪 Synthetic data generation for cross-client knowledge transfer
+- 🔁 Bidirectional knowledge distillation between server and clients
+- 🎯 Sample learnability-based selection for efficient training
+- 🧩 Support for multi-modal medical datasets (MRI, fundus, ultrasound, etc.)
+
+---
+
+## 📂 Dataset Preparation
+
+### Data format
+All datasets should be converted into:
+
+```bash
+dataset/
+├── Client_1/
+│   ├── data_npy/
+│   ├── label_npy/
+│   ├── val_data_npy/
+│   └── val_label_npy/
+├── Client_2/
+│   ├── data_npy/
+│   ├── label_npy/
+│   ├── val_data_npy/
+│   └── val_label_npy/
+└── ...
+```
+
+---
+
+## 📂 Perform Mutual KD
+
+### Nuclei
+
+To run experiments on the nuclei dataset, please refer to `run_nuclei.sh`.
