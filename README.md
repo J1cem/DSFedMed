@@ -1,8 +1,7 @@
-# 📌 [AAAI 2026] DSFedMed: Federated Image Segmentation between Foundation and Lightweight Models
+# 📌 DSFedMed: Federated Image Segmentation between Foundation and Lightweight Models
 
 ## 🧠 Overview
-This repository implements **DSFedMed**, a synthetic data-driven federated learning framework for medical image segmentation.  
-The core idea is to leverage **synthetic data and bidirectional knowledge distillation** to improve global model performance under **data heterogeneity (Non-IID)** and **privacy constraints**.
+This repository implements **DSFedMed**, a synthetic data-driven federated learning framework for medical image segmentation. The core idea is to leverage **synthetic data and bidirectional knowledge distillation** to improve global model performance under **data heterogeneity (Non-IID)** and **privacy constraints**.
 
 ## 🚀 Key Features
 
