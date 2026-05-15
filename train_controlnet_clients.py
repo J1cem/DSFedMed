@@ -50,6 +50,14 @@ def main():
     parser.add_argument("--hidden_channels", type=int, default=32)
     parser.add_argument("--noise_channels", type=int, default=8)
     parser.add_argument("--num_blocks", type=int, default=4)
+    parser.add_argument(
+        "--controlnet_tuning_mode",
+        choices=["lora", "full"],
+        default="lora",
+        help="Use memory-efficient LoRA adapters or full ControlNet branch fine-tuning",
+    )
+    parser.add_argument("--controlnet_lora_rank", type=int, default=4, help="LoRA rank used when --controlnet_tuning_mode=lora")
+    parser.add_argument("--controlnet_lora_alpha", type=float, default=1.0, help="LoRA scale alpha used when --controlnet_tuning_mode=lora")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--gpu", type=int, default=0)
@@ -62,16 +70,31 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     client_names = parse_client_names(args.client_names)
-    config = ControlNetConfig(hidden_channels=args.hidden_channels, noise_channels=args.noise_channels, num_blocks=args.num_blocks)
+    config = ControlNetConfig(
+        hidden_channels=args.hidden_channels,
+        noise_channels=args.noise_channels,
+        num_blocks=args.num_blocks,
+        tuning_mode=args.controlnet_tuning_mode,
+        lora_rank=args.controlnet_lora_rank,
+        lora_alpha=args.controlnet_lora_alpha,
+    )
 
     manifest = {"config": config.__dict__, "clients": []}
     for client_idx, client_name in enumerate(client_names):
         dataset = build_dataset(args, client_idx, client_names)
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+        # Keep the frozen ControlNet backbone identical across clients; in LoRA
+        # mode only the low-rank adapters become client-specific.
+        torch.manual_seed(args.seed)
         model = ControlNetGenerator(config).to(device)
         model.base.eval()
         model.control.train()
-        optimizer = torch.optim.AdamW(model.control.parameters(), lr=args.lr)
+        total_params, trainable_params = model.control_parameter_counts()
+        print(
+            f"client={client_name} ControlNet tuning={config.tuning_mode} "
+            f"trainable={trainable_params:,}/{total_params:,} params"
+        )
+        optimizer = torch.optim.AdamW(model.control_trainable_parameters(), lr=args.lr)
 
         for epoch in range(args.epochs):
             running = 0.0

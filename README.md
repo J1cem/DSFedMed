@@ -52,8 +52,11 @@ python train_controlnet_clients.py \
   --data Nuclei_od \
   --output_dir /path/to/uploaded_controlnets \
   --epochs 10 \
-  --batch_size 4
+  --batch_size 4 \
+  --controlnet_tuning_mode lora
 ```
+
+Use `--controlnet_tuning_mode lora` when GPU memory is limited. This freezes the ControlNet branch's original convolution/norm parameters and trains only low-rank LoRA adapters. Use `--controlnet_tuning_mode full` to reproduce full ControlNet branch fine-tuning. The LoRA adapter size can be adjusted with `--controlnet_lora_rank` and `--controlnet_lora_alpha`.
 
 Outputs:
 

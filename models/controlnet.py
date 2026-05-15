@@ -9,7 +9,7 @@ condition branch (`ControlNetBranch`) while the base generator is frozen.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,15 @@ class ControlNetConfig:
     hidden_channels: int = 32
     noise_channels: int = 8
     num_blocks: int = 4
+    tuning_mode: str = "full"
+    lora_rank: int = 4
+    lora_alpha: float = 1.0
+
+    def __post_init__(self):
+        if self.tuning_mode not in {"full", "lora"}:
+            raise ValueError("tuning_mode must be either 'full' or 'lora'")
+        if self.lora_rank <= 0:
+            raise ValueError("lora_rank must be positive")
 
 
 def _valid_group_count(channels: int, max_groups: int = 8) -> int:
@@ -32,15 +41,77 @@ def _valid_group_count(channels: int, max_groups: int = 8) -> int:
     return 1
 
 
+class LoRAConv2d(nn.Module):
+    """Conv2d with frozen base weights plus trainable low-rank adapters."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int = 0,
+        rank: int = 4,
+        alpha: float = 1.0,
+        initialize_base_to_zero: bool = False,
+    ):
+        super().__init__()
+        self.base = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+        if initialize_base_to_zero:
+            nn.init.zeros_(self.base.weight)
+            nn.init.zeros_(self.base.bias)
+        for param in self.base.parameters():
+            param.requires_grad = False
+
+        self.lora_down = nn.Conv2d(in_channels, rank, kernel_size=kernel_size, padding=padding, bias=False)
+        self.lora_up = nn.Conv2d(rank, out_channels, kernel_size=1, bias=False)
+        self.scale = alpha / rank
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=5**0.5)
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.base(x) + self.scale * self.lora_up(self.lora_down(x))
+
+
+def _make_control_conv(
+    config: ControlNetConfig,
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int,
+    padding: int = 0,
+    initialize_base_to_zero: bool = False,
+) -> nn.Module:
+    if config.tuning_mode == "lora":
+        return LoRAConv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            rank=config.lora_rank,
+            alpha=config.lora_alpha,
+            initialize_base_to_zero=initialize_base_to_zero,
+        )
+    conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding)
+    if initialize_base_to_zero:
+        nn.init.zeros_(conv.weight)
+        nn.init.zeros_(conv.bias)
+    return conv
+
+
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, config: Optional[ControlNetConfig] = None):
         super().__init__()
         groups = _valid_group_count(out_channels)
+        if config is None:
+            conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+            conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        else:
+            conv1 = _make_control_conv(config, in_channels, out_channels, kernel_size=3, padding=1)
+            conv2 = _make_control_conv(config, out_channels, out_channels, kernel_size=3, padding=1)
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            conv1,
             nn.GroupNorm(num_groups=groups, num_channels=out_channels),
             nn.SiLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            conv2,
             nn.GroupNorm(num_groups=groups, num_channels=out_channels),
             nn.SiLU(inplace=True),
         )
@@ -86,13 +157,28 @@ class ControlNetBranch(nn.Module):
 
     def __init__(self, config: ControlNetConfig):
         super().__init__()
+        self.config = config
         channels = config.hidden_channels
-        self.encoder = ConvBlock(config.mask_channels, channels)
-        self.blocks = nn.ModuleList([ConvBlock(channels, channels) for _ in range(config.num_blocks)])
-        self.zero_convs = nn.ModuleList([nn.Conv2d(channels, channels, kernel_size=1) for _ in range(config.num_blocks)])
-        for conv in self.zero_convs:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
+        self.encoder = ConvBlock(config.mask_channels, channels, config=config)
+        self.blocks = nn.ModuleList([ConvBlock(channels, channels, config=config) for _ in range(config.num_blocks)])
+        self.zero_convs = nn.ModuleList(
+            [
+                _make_control_conv(
+                    config,
+                    channels,
+                    channels,
+                    kernel_size=1,
+                    initialize_base_to_zero=True,
+                )
+                for _ in range(config.num_blocks)
+            ]
+        )
+        if config.tuning_mode == "lora":
+            self._freeze_non_lora_parameters()
+
+    def _freeze_non_lora_parameters(self):
+        for name, param in self.named_parameters():
+            param.requires_grad = ".lora_" in name
 
     def forward(self, mask: torch.Tensor) -> List[torch.Tensor]:
         x = self.encoder(mask)
@@ -123,6 +209,14 @@ class ControlNetGenerator(nn.Module):
 
     def load_control_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
         return self.control.load_state_dict(state_dict, strict=strict)
+
+    def control_trainable_parameters(self) -> Iterator[nn.Parameter]:
+        return (param for param in self.control.parameters() if param.requires_grad)
+
+    def control_parameter_counts(self) -> Tuple[int, int]:
+        total = sum(param.numel() for param in self.control.parameters())
+        trainable = sum(param.numel() for param in self.control.parameters() if param.requires_grad)
+        return total, trainable
 
 
 def average_control_states(
