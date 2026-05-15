@@ -11,6 +11,7 @@ from tensorboardX import SummaryWriter
 import copy
 import shutil
 import argparse
+import subprocess
 import logging
 import time
 import random
@@ -574,6 +575,94 @@ def test(site_index, test_net):
         logging.info("******Test OD dice_avg %.4f, Eiou %.4f" % (dice_avg, eiou_avg))
         return dice_avg, eiou_avg
 
+
+def select_learnable_samples(out_teacher, out_student, label_batch, lossfunc_pixelwise, keep_ratio=0.5, confidence_weight=0.5):
+    """Select synthetic samples using DSFedMed learnability.
+
+    Learnability combines (1) SAM confidence/reliability and (2) the prediction
+    gap between SAM and TinySAM. High-confidence samples with larger gaps carry
+    stronger bidirectional distillation signals.
+    """
+    batch_size = out_teacher.shape[0]
+    teacher_prob = torch.sigmoid(out_teacher.detach())
+    student_prob = torch.sigmoid(out_student.detach())
+    sam_confidence = torch.abs(teacher_prob - 0.5).view(batch_size, -1).mean(dim=1) * 2.0
+    pred_gap = torch.abs(teacher_prob - student_prob).view(batch_size, -1).mean(dim=1)
+    teacher_loss = lossfunc_pixelwise(out_teacher.detach(), label_batch).view(batch_size, -1).mean(dim=1)
+    reliability = 1.0 / (1.0 + teacher_loss)
+    score = confidence_weight * sam_confidence * reliability + (1.0 - confidence_weight) * pred_gap
+    topk = min(max(int(keep_ratio * batch_size), 1), batch_size)
+    _, idx = torch.topk(score, topk, largest=True)
+    return idx.long(), score
+
+
+def run_controlnet_synthesis_if_requested(args, client_name, data_path, syn_data_path):
+    if not args.generate_syn_data:
+        return
+    if args.controlnet_dir is None:
+        raise ValueError("--generate_syn_data requires --controlnet_dir produced by train_controlnet_clients.py")
+    cmd = [
+        sys.executable,
+        "generate_synthetic_controlnet.py",
+        "--controlnet_dir", args.controlnet_dir,
+        "--output_dir", syn_data_path,
+        "--client_names", ",".join(client_name),
+        "--mask_root", data_path,
+        "--samples_per_client", str(args.samples_per_client),
+        "--image_size", str(args.image_size),
+        "--gpu", str(args.gpu),
+    ]
+    if args.controlnet_aggregate:
+        cmd.append("--aggregate")
+    logging.info("Generating synthetic data with ControlNet: %s", " ".join(cmd))
+    subprocess.check_call(cmd)
+
+
+def private_fedavg_round(global_student, dataloaders, source_indices, weights, steps, lossfunc, device):
+    """Train TinySAM copies on private client data, then FedAvg into global_student."""
+    if not dataloaders:
+        return global_student
+    client_states = []
+    for client_idx in source_indices:
+        local_model = copy.deepcopy(global_student).to(device)
+        local_model.train()
+        optimizer = torch.optim.Adam(local_model.parameters(), lr=args.base_lr, betas=(0.9, 0.999))
+        loader = dataloaders[client_idx]
+        for step, sampled_batch in enumerate(loader):
+            if step >= steps:
+                break
+            volume_batch, label_batch, pt = sampled_batch['image'], sampled_batch['label'], sampled_batch['pt']
+            volume_batch_raw = volume_batch[:, :3, ...].to(device)
+            label_batch = label_batch.to(device)
+            point_labels = torch.ones(volume_batch.size(0))
+            coords_torch = torch.as_tensor(pt, dtype=torch.float, device=device)
+            labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=device)
+            pt_prompt = (coords_torch[None, :, :], labels_torch[None, :])
+            with torch.no_grad():
+                se, de = local_model.prompt_encoder(points=pt_prompt, boxes=None, masks=None)
+            image_encoded = local_model.image_encoder(volume_batch_raw)
+            pred, _, _ = local_model.mask_decoder(
+                image_embeddings=image_encoded,
+                image_pe=local_model.prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=se,
+                dense_prompt_embeddings=de,
+                multimask_output=False,
+            )
+            loss = lossfunc(pred, label_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        client_states.append(copy.deepcopy(local_model.state_dict()))
+        del local_model
+    aggregated_state = OrderedDict()
+    for key in client_states[0].keys():
+        if torch.is_floating_point(client_states[0][key]):
+            aggregated_state[key] = sum(weights[i] * state[key] for i, state in enumerate(client_states))
+        else:
+            aggregated_state[key] = client_states[0][key]
+    global_student.load_state_dict(aggregated_state, strict=True)
+    return global_student
+
 def copy_outer_net(fast_weights,net_current):
     # Deep copy the net current model
     net_copy = copy.deepcopy(net_current)
@@ -592,6 +681,7 @@ if __name__ == "__main__":
     logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     GPUdevice = torch.device('cuda', int(args.gpu))
     logging.info(str(args))
+    run_controlnet_synthesis_if_requested(args, client_name, data_path, syn_data_path)
 
     # 构造合成数据集 DataLoader
     dataset_list = []
@@ -632,6 +722,20 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.Adam(student_net.parameters(), lr=args.base_lr, betas=(0.9, 0.999))
     tea_optimizer = torch.optim.Adam(teacher_net.parameters(), lr=args.base_lr, betas=(0.9, 0.999))
+
+    private_dataloaders = {}
+    if args.enable_private_fedavg:
+        for private_client_idx in source_site_idx:
+            if "prostate" in args.data.lower():
+                private_dataset = ProstateDataset(client_idx=private_client_idx, data_path=data_path, freq_site_idx=private_client_idx,
+                                                 split='train', transform=transforms.Compose([ToTensor()]), client_name=client_name)
+            else:
+                private_dataset = Dataset(client_idx=private_client_idx, data_path=data_path, freq_site_idx=private_client_idx,
+                                          split='train', transform=transforms.Compose([ToTensor()]), client_name=client_name)
+            private_dataloaders[private_client_idx] = DataLoader(
+                private_dataset, batch_size=batch_size, shuffle=True, num_workers=4,
+                pin_memory=True, worker_init_fn=lambda id: random.seed(args.seed + id))
+
     # 蒸馏损失函数设置
     lossfunc = torch.nn.BCEWithLogitsLoss(pos_weight=torch.ones([1]).cuda(GPUdevice) * 2)
     lossfunc_pixelwise = torch.nn.BCEWithLogitsLoss(pos_weight=torch.ones([1]).cuda(GPUdevice) * 2, reduction='none')
@@ -713,34 +817,14 @@ if __name__ == "__main__":
             B = volume_batch.shape[0]
 
             with torch.no_grad():
-                # 每个样本的 supervision loss
-                loss_teacher_each = lossfunc_pixelwise(out_teacher, label_batch).view(B, -1).mean(dim=1)
-                loss_student_each = lossfunc_pixelwise(out_student, label_batch).view(B, -1).mean(dim=1)
-
-                # ========== 分位数筛选可靠样本 ==========
-                reliable_ratio = 0.7  # 保留 GT loss 最小的 70% 样本
-
-                teacher_thresh = torch.quantile(loss_teacher_each, reliable_ratio)
-                student_thresh = torch.quantile(loss_student_each, reliable_ratio)
-
-                reliable_mask = (loss_teacher_each <= teacher_thresh) & (loss_student_each <= student_thresh)
-
-                if reliable_mask.sum() == 0:
-                    reliable_mask[:] = True  # fallback防止选空
-
-                # 计算 KL 差异
-                loss_kl_1_map = loss_kl_1_each.view(B, -1).mean(dim=1)
-                loss_kl_2_map = loss_kl_2_each.view(B, -1).mean(dim=1)
-                kl_sum = loss_kl_1_map + loss_kl_2_map
-
-                # 把不可靠样本排除掉
-                kl_sum[~reliable_mask] = -1e9  # 极值 确保不会被选中
-
-                # 选择 KL 最大的一部分可靠样本
-                topk = min(max(int(k_ratio * B), 1), B)
-                _, idx = torch.topk(kl_sum, topk, largest=True)
-                idx = idx.long()
-
+                idx, learnability_score = select_learnable_samples(
+                    out_teacher,
+                    out_student,
+                    label_batch,
+                    lossfunc_pixelwise,
+                    keep_ratio=k_ratio,
+                    confidence_weight=args.learnability_conf_weight,
+                )
 
             # 蒸馏 loss 只在 selected sample 上计算
             loss_kl_1_selected = loss_kl_1_each[idx].mean()
@@ -772,6 +856,12 @@ if __name__ == "__main__":
                              f"Feature Loss: {loss_feat.item():.4f}, "
                              f"Total: {total_loss.item():.4f}")
             
+        if args.enable_private_fedavg:
+            student_net = private_fedavg_round(
+                student_net, private_dataloaders, source_site_idx, client_weight,
+                args.private_fedavg_steps, lossfunc, GPUdevice)
+            optimizer = torch.optim.Adam(student_net.parameters(), lr=args.base_lr, betas=(0.9, 0.999))
+
         print("=== Evaluating Tiny SAM Model ===")
         dice, iou = validation(student_net)
         print("=== Evaluating Global SAM Model ===")
